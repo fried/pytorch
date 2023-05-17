@@ -1074,6 +1074,10 @@ def fallback_node_due_to_unsupported_type(node: torch.fx.Node, allow_cpu_inputs=
     if node.target is aten.view_as_complex.default:
         return False
 
+    # We should be able to remove this special case once `disable_cpp_codegen` is killed.
+    if node.target is aten.lift_fresh_copy.default:
+        return False
+
     def check_skip_condition(node, is_output):
         if not isinstance(node, torch.fx.Node):
             return False
@@ -1537,6 +1541,20 @@ make_fallback(aten.miopen_batch_norm, warn=False)
 if torch.version.hip is not None and torch.cuda.is_available():
     # tl.reduce not available yet in ROCm's version of triton
     make_fallback(aten.prod, warn=False)
+
+
+@register_lowering(aten.copy)
+def copy(self, src, non_blocking=False):
+    x = src
+    if self.get_device() != src.get_device():
+        x = to_device(x, self.get_device())
+    if self.get_dtype() == src.get_dtype():
+        x = to_dtype(x, self.get_dtype())
+
+    if self.get_size() != src.get_size():
+        out = expand(src, self.get_size())
+        return clone(out)
+    return clone(src)
 
 
 @register_lowering(aten.clone)
