@@ -8,11 +8,15 @@ from collections import namedtuple
 import torch
 import torch._dynamo
 import torch.fx
+from torch.fx.graph import _PyTreeCodeGen, _PyTreeInfo
 from . import graph_module
 from torch._decomp import core_aten_decompositions
 from torch._dynamo.eval_frame import Constraint
+from torch._functorch.aot_autograd import aot_export_module
+from torch._guards import detect_fake_mode
 
 import torch.utils._pytree as pytree
+from torch._export.graph_module import EXPORT_METADATA, MutationData
 from torch._export.pass_base import PassType
 from torch.fx.experimental.symbolic_shapes import (
     ConstraintViolationError,
@@ -106,33 +110,66 @@ def _export(
 
     with torch._dynamo.config.patch(dataclasses.asdict(ExportDynamoConfig())):  # type: ignore[attr-defined]
         try:
-            gm, _ = torch._dynamo.export(
+            gm_torch_level, _ = torch._dynamo.export(
                 f,
                 *args,
-                aten_graph=True,
-                tracing_mode="symbolic",
-                decomposition_table=DECOMP_TABLE,
                 constraints=constraints,
                 assume_static_by_default=True,
-                functionalize=True,
             )
+
+            fake_inps = []
+            for node in gm_torch_level.graph.nodes:
+                if node.op == "placeholder" and "val" in node.meta:
+                    fake_val = node.meta["val"]
+                    fake_inps.append(fake_val)
+
+            fake_mode = detect_fake_mode(fake_inps)
+
+            fake_args = pytree.tree_map_only(torch.Tensor, fake_mode.from_tensor, args)
+
+            # Fix the graph output signature to be tuple if scalar
+            return_val = f(*args)
+            # this means it is scalar return value
+            out_spec = orig_out_spec = gm_torch_level._out_spec
+
+            if not isinstance(return_val, (list, tuple, dict)):
+                out_spec = pytree.tree_flatten((return_val,))[1]
+
+            orig_args = gm_torch_level.graph._codegen.pytree_info.orig_args
+
+            gm_torch_level.graph._codegen = _PyTreeCodeGen(
+                _PyTreeInfo(
+                    orig_args,
+                    gm_torch_level._in_spec,
+                    out_spec,
+                )
+            )
+
+            gm_torch_level.recompile()
+
+            gm, graph_signature = aot_export_module(gm_torch_level, fake_args, decompositions=DECOMP_TABLE, trace_joint=False)
+            mutation_data = MutationData(
+                parameters=graph_signature.parameters,
+                buffers=graph_signature.buffers,
+                user_inputs=graph_signature.user_inputs,
+                user_outputs=graph_signature.user_outputs,
+                inputs_to_parameters = graph_signature.inputs_to_parameters,
+                inputs_to_buffers=graph_signature.inputs_to_buffers,
+                buffers_to_mutate=graph_signature.buffers_to_mutate
+            )
+
+            flat_args, in_spec = pytree.tree_flatten(args)
+            export_graph_module = graph_module.make_export_graph_module(
+                gm, gm.graph, in_spec, orig_out_spec, flat_args, mutation_data
+            )
+            return export_graph_module
+
         except (ConstraintViolationError, ValueRangeError) as e:
             raise UserError(UserErrorType.CONSTRAIN_VIOLATION, str(e))
         except GuardOnDataDependentSymNode as e:
             raise UserError(
                 UserErrorType.ANTI_PATTERN,
                 f"Consider annotating your code using constrain_as_*(). {str(e)}")
-
-    flat_args, in_spec = pytree.tree_flatten(args)
-    out_spec = (
-        gm.graph._codegen.pytree_info.out_spec or pytree.tree_flatten(f(*args))[1]  # type: ignore[attr-defined]
-    )
-    # TODO: Track mutation
-    mutation = None
-    export_graph_module = graph_module.make_export_graph_module(
-        gm, gm.graph, in_spec, out_spec, mutation, flat_args
-    )
-    return export_graph_module
 
 
 # MultiMethodExportedProgram represents an exported program that contains
@@ -216,7 +253,22 @@ class MultiMethodExportedProgram:
         "Please look up one of its methods first via "
         "`MultiMethodExportedProgram.find_method(method_name)`."""
 
-        return gm(*args, **kwargs)
+        assert EXPORT_METADATA in gm.meta, "Exported graph module must have EXPORT_METADATA field"
+        meta = gm.meta[EXPORT_METADATA]
+
+        params = {
+            **dict(gm.named_parameters(remove_duplicate=False)),
+            **dict(gm.named_buffers(remove_duplicate=False)),
+        }
+
+        params_flat, params_spec = pytree.tree_flatten(params)
+        params_flat = tuple(params_flat)
+
+        user_flat_args = pytree.tree_flatten(args)[0]
+
+        output = gm(*params_flat, *user_flat_args)
+
+        return output
 
     def __repr__(self) -> str:
         # TODO(gmagogsfm): Implement.
