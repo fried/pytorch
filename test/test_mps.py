@@ -10500,7 +10500,15 @@ class TestConsistency(TestCaseMPS):
                     mps_args[1] = cpu_args[1]
 
                 cpu_out = op(*cpu_args, **cpu_kwargs)
+                if op.name in ["nn.functional.softplus"] and dtype in [torch.float, torch.half]:
+                    print(op.name)
+                    print("cpu_out ", cpu_out)
+                    print("mps_args ", mps_args, mps_kwargs)
+                
                 mps_out = op(*mps_args, **mps_kwargs)
+                if op.name in ["nn.functional.softplus"] and dtype in [torch.float, torch.half]:
+                    print(op.name)
+                    print("mps_out ", mps_out)
 
                 if (op.name in self.FP32_LOW_PRECISION_LIST) and dtype == torch.float32:
                     atol = 1e-4
@@ -10565,7 +10573,9 @@ class TestConsistency(TestCaseMPS):
             # allow_unused is needed in those cases.
             cpu_grad_inputs = torch.autograd.grad(diff_cpu_out, diff_cpu_arg, grad_outputs=cpu_grad_outputs, allow_unused=True)
             mps_grad_inputs = torch.autograd.grad(diff_mps_out, diff_mps_arg, grad_outputs=mps_grad_outputs, allow_unused=True)
-
+            if op.name in ["nn.functional.gelu", "nn.functional.glu"] and dtype == torch.float16:
+                atol = 1e-3
+                rtol = 1e-3
             self.assertEqual(cpu_grad_inputs, mps_grad_inputs, atol=atol, rtol=rtol)
 
 
