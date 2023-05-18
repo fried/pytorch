@@ -17,6 +17,9 @@ inline int64_t normalize_dim(int64_t d, int64_t n) {
 } // namespace
 
 Tensor cat_batch(const MaterializedITensorListRef& tensors, vTensor& v_output) {
+  (void)tensors;
+  (void)v_output;
+
   TORCH_CHECK(false, "Vulkan cat not implemented for batch dimension!");
 }
 
@@ -25,41 +28,40 @@ Tensor cat_feature(
     vTensor& v_output) {
   api::Context* const context = api::context();
 
-  int64_t ch_size_allprior = 0;
-  int64_t ch_interval = 0;
+  // Determine the channels of the output tensor
+  int64_t ch_total = 0;
   for (const at::Tensor& tensor : tensors) {
-    ch_interval += tensor.sizes()[1];
+    ch_total += get_dim<Dim4D::Channel>(tensor);
   }
-  ch_interval = api::utils::align_up(ch_interval, INT64_C(4));
+  ch_total = api::utils::align_up(ch_total, INT64_C(4));
 
+  // Running counter of the number of channels already appended.
+  int64_t ch_current = 0;
   for (const at::Tensor& tensor : tensors) {
     const Tensor self = tensor.is_vulkan() ? tensor : tensor.vulkan();
     const vTensor& v_self = convert(self);
 
-    uint32_t in_channels = safe_downcast<uint32_t>(v_self.sizes()[1]);
-    uint32_t in_ch_aligned = api::utils::align_up(in_channels, 4u);
-
     const struct Block final {
-      ivec3 out_extents;
+      ivec3 outExtents;
       int32_t fill0;
-      ivec3 in_extents;
+      ivec3 inExtents;
       int32_t fill1;
       uint32_t batchSize;
       uint32_t chSize;
-      uint32_t chInterval;
-      uint32_t chSizeAllprior;
+      uint32_t chTotal;
+      uint32_t chCurrent;
     } block{
         api::utils::make_ivec3(v_output.extents()),
         0,
         api::utils::make_ivec3(v_self.extents()),
         0,
-        safe_downcast<uint32_t>(v_self.sizes()[0]),
-        in_ch_aligned,
-        safe_downcast<uint32_t>(ch_interval),
-        safe_downcast<uint32_t>(ch_size_allprior),
+        get_dim<Dim4D::Batch>(v_self),
+        api::utils::align_up(get_dim<Dim4D::Channel>(v_self), 4u),
+        safe_downcast<uint32_t>(ch_total),
+        safe_downcast<uint32_t>(ch_current),
     };
 
-    ch_size_allprior += v_self.sizes()[1];
+    ch_current += v_self.sizes()[1];
 
     api::UniformParamsBuffer params(context, block);
     api::PipelineBarrier pipeline_barrier{};
@@ -144,6 +146,9 @@ Tensor cat_feature_mult4ch(
 }
 
 Tensor cat_width(const MaterializedITensorListRef& tensors, vTensor& v_output) {
+  (void)tensors;
+  (void)v_output;
+
   TORCH_CHECK(false, "Vulkan cat not implemented for width dimension!");
 }
 
@@ -184,11 +189,11 @@ Tensor cat_height(
 }
 
 Tensor cat(const at::ITensorListRef& tensors, const int64_t in_dim) {
-  TORCH_CHECK(tensors.size() > 0, "Vulkan cat expects at least one tensor");
+  TORCH_CHECK(!tensors.empty(), "Vulkan cat expects at least one tensor");
 
   const int64_t dim = normalize_dim(in_dim, 4);
   auto materialized = tensors.materialize();
-  TORCH_INTERNAL_ASSERT(materialized.size() > 0, "Accessing empty array");
+  TORCH_INTERNAL_ASSERT(!materialized.empty(), "Accessing empty array");
   const at::Tensor& tensor = materialized[0];
   int64_t cat_dim_size = 0;
   bool is_mult4ch = true;
@@ -213,7 +218,7 @@ Tensor cat(const at::ITensorListRef& tensors, const int64_t in_dim) {
   }
 
   auto result_size = tensor.sizes().vec();
-  TORCH_INTERNAL_ASSERT(result_size.size() > 0, "Accessing empty array");
+  TORCH_INTERNAL_ASSERT(!result_size.empty(), "Accessing empty array");
   result_size[dim] = cat_dim_size;
 
   vTensor v_output{api::context(), result_size, tensor.scalar_type()};

@@ -24,12 +24,12 @@ layout(set = 0, binding = 2) uniform PRECISION restrict Block {
   ivec4 in_extents;
   // input tensor's batch size
   uint batch_size;
-  // input tensor's channel size
+  // input tensor's channel size, aligned to 4
   uint ch_size;
-  // channel interval (total # of channels for all tensors)
-  uint ch_interval;
-  // # of channels for tensor 0 to i-1 at ith tensor
-  uint ch_size_allprior;
+  // total number of channels in the output tensor, aligned to 4
+  uint ch_total;
+  // number of channels already appended
+  uint ch_current;
 }
 uBlock;
 
@@ -40,6 +40,7 @@ layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
 
 void main() {
   const ivec3 in_pos = ivec3(gl_GlobalInvocationID);
+
   const uint max_src_index = uBlock.ch_size * uBlock.batch_size;
 
   if (any(greaterThanEqual(in_pos, uBlock.in_extents.xyz))) {
@@ -51,18 +52,17 @@ void main() {
   const vec4 in_tex = texelFetch(uInput, in_pos, 0);
 
   for (uint i = 0; i < 4; ++i) {
-    uint src_index = in_pos.z * 4 + i;
+    uint src_nc_idx = in_pos.z * 4 + i;
+    uint src_n_idx = src_nc_idx / uBlock.ch_size;
+    uint src_c_idx = src_nc_idx % uBlock.ch_size;
 
-    if (src_index >= max_src_index) {
+    if (src_nc_idx >= max_src_index) {
       // out of range
       break;
     }
 
-    uint src_n_idx = src_index / uBlock.ch_size;
-    uint src_c_idx = src_index % uBlock.ch_size;
-
-    uint dst_nc_idx =
-        src_n_idx * uBlock.ch_interval + src_c_idx + uBlock.ch_size_allprior;
+    uint dst_c_idx = src_c_idx + uBlock.ch_current;
+    uint dst_nc_idx = src_n_idx * uBlock.ch_total + dst_c_idx;
 
     out_pos.z = int(dst_nc_idx / 4);
     uint j = (dst_nc_idx % 4);
