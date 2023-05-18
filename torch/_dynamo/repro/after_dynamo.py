@@ -7,7 +7,7 @@ import shutil
 import sys
 import textwrap
 from importlib import import_module
-from typing import Union
+from typing import Any, Callable, Union
 
 import torch
 import torch.fx as fx
@@ -27,6 +27,7 @@ from torch._dynamo.debug_utils import (
     NopInputReader,
     run_fwd_maybe_bwd,
     same_two_models,
+    TestInputWriter,
 )
 from torch.fx.experimental.symbolic_shapes import fx_placeholder_targets
 from torch.hub import tqdm
@@ -184,7 +185,68 @@ if __name__ == '__main__':
     )
 
 
-def dump_backend_repro_as_file(gm, args, compiler_name, check_accuracy=False):
+def generate_dynamo_fx_test_from_repro_string(
+    gm,
+    args,
+    compiler_name,
+):
+    """
+    Generate a test string for backend-agnostic minified version.
+    """
+
+    model_str = NNModuleToString.convert(gm, imports=False)
+
+    writer = TestInputWriter()
+    for placeholder, arg in zip(fx_placeholder_targets(gm), args):
+        if isinstance(arg, (int, torch.SymInt)):
+            writer.symint(placeholder, arg)
+        elif isinstance(arg, torch.Tensor):
+            # TODO: improve these names with FQN
+            writer.tensor(placeholder, arg)
+        else:
+            raise TypeError(f"arg is neither SymInt/int nor torch.Tensor, {arg}")
+    load_args = "\n".join(writer.lines())
+    storage_names = ",".join(writer._storage_names)
+
+    return textwrap.dedent(
+        f"""
+from math import inf
+import torch
+from torch import tensor, device
+import torch.fx as fxindent
+import torch._dynamo
+from torch._dynamo.testing import rand_strided
+from torch._dynamo.debug_utils import run_fwd_maybe_bwd
+from torch.nn import *
+import torch._dynamo.test_case
+import torch._dynamo.testing
+
+{generate_config_string(stable_output=False)}
+
+{extra_imports}
+
+class GeneratedReproTestCase(torch._dynamo.test_case.TestCase):
+    def test_generated_repro_case(self):
+        {textwrap.indent(model_str, ' ' * 8)}
+
+        {load_args}
+        # TODO(voz): Add dynamic, nopython, and all sorts of other configs
+        optimized_result = torch._dynamo.optimize({compiler_name!r})(Repro())({storage_names})
+        eager_result = Repro()({storage_names})
+        self.assertEqual(optimized_result, eager_result)
+
+
+if __name__ == '__main__':
+    from torch._dynamo.test_case import run_tests
+
+    run_tests()
+"""
+    )
+
+
+def dump_backend_repro_as_file(
+    gm, args, compiler_name, check_accuracy=False, produce_test=False
+):
     """
     Saves the repro to a repro.py file
     """
@@ -192,18 +254,25 @@ def dump_backend_repro_as_file(gm, args, compiler_name, check_accuracy=False):
     subdir = os.path.join(os.getcwd(), "checkpoints")
     if not os.path.exists(subdir):
         os.makedirs(subdir, exist_ok=True)
-    file_name = os.path.join(subdir, f"minified_{len(gm.graph.nodes)}_nodes.py")
+    file_name = os.path.join(
+        subdir,
+        f"minified_{'test_' if produce_test else ''}{len(gm.graph.nodes)}_nodes.py",
+    )
     log.warning(
         "Writing checkpoint with %s nodes to %s", len(gm.graph.nodes), file_name
     )
 
     with open(file_name, "w") as fd:
-        fd.write(
-            generate_dynamo_fx_repro_string(
-                gm, args, compiler_name, check_accuracy, save_dir=subdir
+        if produce_test:
+            fd.write(generate_dynamo_fx_test_from_repro_string(gm, args, compiler_name))
+        else:
+            fd.write(
+                generate_dynamo_fx_repro_string(
+                    gm, args, compiler_name, check_accuracy, save_dir=subdir
+                )
             )
-        )
-    latest_repro = os.path.join(curdir, "repro.py")
+
+    latest_repro = os.path.join(curdir, "test.py" if produce_test else "repro.py")
     log.warning("Copying %s to %s for convenience", file_name, latest_repro)
 
     if use_buck:
@@ -212,7 +281,9 @@ def dump_backend_repro_as_file(gm, args, compiler_name, check_accuracy=False):
     shutil.copyfile(file_name, latest_repro)
 
 
-def dump_backend_state(gm, args, compiler_name, check_accuracy=False):
+def dump_backend_state(
+    gm, args, compiler_name, check_accuracy=False, produce_test=False
+):
     """
     Dumps the dynamo graph to repro the issue.
     1) It tries to convert Fx GraphModule to a string. If we can, it writes to a
@@ -221,7 +292,9 @@ def dump_backend_state(gm, args, compiler_name, check_accuracy=False):
     the module and save a tar file.
     """
     assert NNModuleToString.can_convert_to_string(gm)
-    return dump_backend_repro_as_file(gm, args, compiler_name, check_accuracy)
+    return dump_backend_repro_as_file(
+        gm, args, compiler_name, check_accuracy, produce_test
+    )
     # return dump_backend_repro_as_tarfile(gm, args, compiler_name)
 
 
@@ -253,7 +326,7 @@ def dump_to_minify_after_dynamo(gm, args, compiler_name):
 
 
 @register_debug_backend
-def dynamo_minifier_backend(gm, example_inputs, compiler_name):
+def dynamo_minifier_backend(gm, example_inputs, compiler_name, produce_test):
     from functorch.compile import minifier
 
     compiler_fn = lookup_backend(compiler_name)
@@ -275,7 +348,7 @@ def dynamo_minifier_backend(gm, example_inputs, compiler_name):
             "Compiled Fx GraphModule failed. Creating script to minify the error."
         )
         dump_state_fn = functools.partial(
-            dump_backend_state, compiler_name=compiler_name
+            dump_backend_state, compiler_name=compiler_name, produce_test=produce_test
         )
         dump_state_fn(fx.GraphModule(gm, copy.deepcopy(gm.graph)), example_inputs)
         fails_fn = functools.partial(
@@ -384,7 +457,7 @@ def repro_common(options, mod, load_args):
     return args
 
 
-def repro_minify(options, mod, load_args):
+def repro_minify(options, mod, load_args, *, produce_test=False):
     args = repro_common(options, mod, load_args)
 
     # Setup debug minifier compiler
@@ -402,8 +475,7 @@ def repro_minify(options, mod, load_args):
         )
 
     dynamo_minifier_backend = functools.partial(
-        compiler_fn,
-        compiler_name=options.backend,
+        compiler_fn, compiler_name=options.backend, produce_test=produce_test
     )
     opt_mod = torch._dynamo.optimize(dynamo_minifier_backend)(mod)
 
@@ -525,7 +597,7 @@ default settings on this script:
         )
 
     subparsers = parser.add_subparsers(
-        dest="command", metavar="{run,minify}", required=True
+        dest="command", metavar="{run,minify,produce-test}", required=True
     )
 
     parser_run = subparsers.add_parser(
@@ -539,13 +611,23 @@ default settings on this script:
     )
     common_flags(parser_minify)
 
+    parser_produce_test = subparsers.add_parser(
+        "produce-test", help="run the minifier on the repro"
+    )
+    common_flags(parser_produce_test)
+
     args = None
     if len(sys.argv) <= 1:
         args = [command, *sys.argv[1:]]
+
+    produce_test: Callable[[Any], Any] = functools.partial(
+        repro_minify, produce_test=True
+    )
 
     options = parser.parse_args(args)
     COMMAND_FNS = {
         "minify": repro_minify,
         "run": repro_run,
+        "produce-test": produce_test,
     }
-    COMMAND_FNS[options.command](options, mod, load_args)
+    COMMAND_FNS[options.command](options, mod, load_args)  # type: ignore[operator]

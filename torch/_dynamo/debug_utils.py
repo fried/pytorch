@@ -9,7 +9,7 @@ import tempfile
 import textwrap
 from collections import Counter
 from importlib import import_module
-from typing import Optional, Sequence
+from typing import List, Optional, Sequence
 
 import torch
 import torch._prims_common as utils
@@ -151,14 +151,14 @@ class NNModuleToString:
         return True
 
     @staticmethod
-    def convert(gm):
+    def convert(gm, imports=True):
         from torch.nn.modules.module import _addindent
 
         tab = " " * 4
 
         model_str = textwrap.dedent(
-            """
-            from torch.nn import *
+            f"""
+            {'from torch.nn import *' if imports else ''}
             class Repro(torch.nn.Module):
                 def __init__(self):
                     super().__init__()
@@ -630,11 +630,18 @@ class InputWriter:
         storage_hash = None
         if self.store is not None and untyped_storage.device.type != "meta":
             storage_hash = self.store.write_storage(untyped_storage)
-        self._lines.append(
-            f"{v} = reader.storage({storage_hash!r}, {nbytes!r}{maybe_device}{maybe_dtype_hint})"
+        self._write_storage_line(
+            v, storage_hash, nbytes, maybe_device, maybe_dtype_hint
         )
         self.seen_storages[ws] = v
         return v
+
+    def _write_storage_line(
+        self, v, storage_hash, nbytes, maybe_device, maybe_dtype_hint
+    ):
+        self._lines.append(
+            f"{v} = reader.storage({storage_hash!r}, {nbytes!r}{maybe_device}{maybe_dtype_hint})"
+        )
 
     def tensor(self, name, t) -> None:
         storage = self.storage(
@@ -665,3 +672,37 @@ class InputWriter:
         if isinstance(val, torch.SymInt):
             val = val.node.hint
         self._lines.append(f"reader.symint({val!r})  # {name}")
+
+
+class TestInputWriter(InputWriter):
+    def __init__(self):
+        super().__init__(save_dir=None, stable_hash=False)
+        self._storage_names = []
+
+    def lines(self):
+        r: List[str] = []
+        r.extend(f"{l}" for l in self._lines)
+        return r
+
+    def storage_names(self):
+        return self._storage_names
+
+    def tensor(self, name, t) -> None:
+        storage = self.storage(
+            t.untyped_storage(), dtype_hint=t.dtype, device_hint=t.device
+        )
+        self._storage_names.append(f"{storage}")
+        self._lines.append(
+            f"{storage} = torch.randn({list(t.size())}, dtype={t.dtype}, device='{t.device.type}')  # {name} \n"
+        )
+
+    def _write_storage_line(
+        self, v, storage_hash, nbytes, maybe_device, maybe_dtype_hint
+    ):
+        pass
+
+    # TODO: this doesn't actually symint atm
+    def symint(self, name, val) -> None:
+        if isinstance(val, torch.SymInt):
+            val = val.node.hint
+        self._lines.append(f"{name} = {val!r})  # {name}")
